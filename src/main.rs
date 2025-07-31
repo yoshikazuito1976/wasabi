@@ -115,7 +115,7 @@ fn efi_main(_image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
     fill_rect(&mut vram, 0x000000, 0, 0, vw, vh).expect("fill_rect failled");
     fill_rect(&mut vram, 0xff0000, 32, 32, 32, 32).expect("fill_rect failed");
     fill_rect(&mut vram, 0x00ff00, 64, 64, 64, 64).expect("fill_rect failed");
-    fill_rect(&mut vram, 0x0000ff, 128, 128, 182, 182).expect("fill_rext failed");
+    fill_rect(&mut vram, 0x0000ff, 128, 128, 128, 128).expect("fill_rext failed");
 
     for i in 0..256 {
         let _ = draw_point(&mut vram, 0x010101 * i as u32, i, i);

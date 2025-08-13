@@ -38,16 +38,111 @@ const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
 enum EfiStatus {
     Success = 0,
 }
+#[repr(i64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum EfiMemoryType {
+    RESERVED = 0,
+    LOADER_CODE,
+    LOADER_DATA,
+    BOOT_SERVICES_CODE,
+    BOOT_SERVICES_DATE,
+    RUNTIME_SERVICES_CODE,
+    RUNTIME_SERVICES_DATA,
+    CONVENTIONAL_MEMORY,
+    UNUSABLE_MEMORY,
+    ACPI_RECLAIM_MEMORY,
+    ACPI_MEMORY_NVS,
+    MEMORY_MAPPED_IO,
+    MEMORY_MAPPED_IO_PORT_SPACE,
+    PAL_CODE,
+    PERSISTENT_MEMORY,
+}
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EfiMemoryDescriptor {
+    memory_type: EfiMemoryType,
+    physical_start: u64,
+    virtual_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+}
+
+const MEMORY_MAP_BUFFER_SIZE: usize = 0x8000;
+
+struct MemoryMapHolder {
+    memory_map_buffer: [u8; Memory_MAP_BUFFER_SIZE],
+    memory_map_size: usize,
+    map_key: usize,
+    descriptor_size: usize,
+    descriptor_version: u32,
+}
+
+struct MemoryMapIterator<'a> {
+    map: &'a MemoryMapHolder,
+    ofs: usize,
+}
+impl<'a> Iterator for MemoryMapIterator<'a> {
+    type Item = &'a EfiMemoryDescriptor;
+    fn next(&mut self) -> Option<&'a EfiMemoryDescritor> {
+        if self.ofs >= self.map.memory_map_size {
+            None
+        } else {
+            let e: &EfiMemoryDescriptor = unsafe {
+                &*(self.map.memory_map_buffer.as_ptr().add(self.ofs) as *const EfiMemoryDescriptor)
+            };
+            self.ofs += self.map.descriptor_size;
+            Some(e)
+        }
+    }
+}
+
+impl MemoryMapHolder {
+    pub const fn new() -> MemoryMapHolder {
+        MemoryMapHolder {
+            memory_map_buffer: [0; MEMORY_MAP_BUFFER_SIZE],
+            map_key: 0,
+            descriptor_size: 0,
+            desciptor_version: 0,
+        }
+    }
+
+    pub fn iter(&self) -> MemoryMapIterator {
+        MemoryMapIterator { map: self, ofs: 0 }
+    }
+}
 
 #[repr(C)]
 struct EfiBootServicesTable {
-    _reserved0: [u64; 40],
+    _reserved0: [u64; 7],
+    get_memory_map: extern "win64" fn(
+        memory_map_size: *mut usize,
+        memory_map: *mut u8,
+        map_key: *mut usize,
+        descriptor_size: *mut usize,
+        descriptor_version: *mut u32,
+    ) -> EfiStatus,
+    _reserved1: [u64; 32],
     locate_protocol: extern "win64" fn(
         protocol: *const EfiGuid,
         registration: *const EfiVoid,
         interface: *mut *mut EfiVoid,
     ) -> EfiStatus,
 }
+
+impl EfiBootServicesTable {
+    fn get_memory_map(&self, map: &mut MemoryMapHolder) -> EfiStatus {
+        (self.get_memory_map)(
+            &mut map.memory_map_size,
+            map.memory_map_buffer.as_mut_ptr(),
+            &mut map.map_key,
+            &mut map.descriptor_size,
+            &mut map.descriptor_version,
+        )
+    }
+}
+
+const _: () = assert!(offset_of!(EfiBootServicesTable, get_memory_map) == 56);
 const _: () = assert!(offset_of!(EfiBootServicesTable, locate_protocol) == 320);
 
 #[repr(C)]
@@ -131,16 +226,24 @@ fn efi_main(_image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
         let _ = draw_line(&mut vram, 0xff00ff, cx, cy, rect_size, i);
         let _ = draw_line(&mut vram, 0xffffff, cx, cy, i, rect_size);
     }
-for (i,c) in "ABCDEF".chars().enumerate(){
-    draw_font_fg(&mut vram, i as i64*16+256,i as i64*16 ,0xffffff, c)                                        
-}
+    for (i, c) in "ABCDEF".chars().enumerate() {
+        draw_font_fg(&mut vram, i as i64 * 16 + 256, i as i64 * 16, 0xffffff, c)
+    }
 
-draw_str_fg(&mut vram, 256,256,0xffffff,"Hello World!");
-let mut w = VramTextWriter::new(&mut vram);
-for i in 0..4{
-    writeln!(w,"i={i}").unwrap();
-}
+    draw_str_fg(&mut vram, 256, 256, 0xffffff, "Hello World!");
+    let mut w = VramTextWriter::new(&mut vram);
+    for i in 0..4 {
+        writeln!(w, "i={i}").unwrap();
+    }
 
+    let mut memory_map = MemoryMapHolder::new();
+    let status = efi_system_table
+        .boot_services
+        .get_memory_map(&mut memory_map);
+    writeln!(w, "{status:?}").unwrap();
+    for e in memory_map.iter() {
+        writeln!(w, "{e:?}").unwrap();
+    }
     //println!("Hello, world!");
     loop {
         hlt()
@@ -166,8 +269,8 @@ trait Bitmap {
     /// which means that passing is_in_*_range tests.
     unsafe fn unchecked_pixel_at_mut(&mut self, x: i64, y: i64) -> *mut u32 {
         self.buf_mut()
-            .add(((y * self.pixels_per_line() + x) * self.bytes_per_pixel()) as usize,
-        ) as *mut u32
+            .add(((y * self.pixels_per_line() + x) * self.bytes_per_pixel()) as usize)
+            as *mut u32
     }
     fn pixel_at_mut(&mut self, x: i64, y: i64) -> Option<&mut u32> {
         if self.is_in_x_range(x) && self.is_in_y_range(y) {
@@ -224,33 +327,16 @@ fn init_vram(efi_system_table: &EfiSystemTable) -> Result<VramBufferInfo> {
 /// # Safety
 ///
 /// (x, y) must be a valid point in the buf.
-unsafe fn unchecked_draw_point<T: Bitmap>(
-    buf: &mut T,
-    color: u32,
-    x: i64,
-    y: i64,
-) {
+unsafe fn unchecked_draw_point<T: Bitmap>(buf: &mut T, color: u32, x: i64, y: i64) {
     *buf.unchecked_pixel_at_mut(x, y) = color;
 }
 
-fn draw_point<T: Bitmap>(
-    buf: &mut T,
-    color: u32,
-    x: i64,
-    y: i64,
-) -> Result<()> {
+fn draw_point<T: Bitmap>(buf: &mut T, color: u32, x: i64, y: i64) -> Result<()> {
     *(buf.pixel_at_mut(x, y).ok_or("Out of Range")?) = color;
     Ok(())
 }
 
-fn fill_rect<T: Bitmap>(
-    buf: &mut T,
-    color: u32,
-    px: i64,
-    py: i64,
-    w: i64,
-    h: i64,
-) -> Result<()> {
+fn fill_rect<T: Bitmap>(buf: &mut T, color: u32, px: i64, py: i64, w: i64, h: i64) -> Result<()> {
     if !buf.is_in_x_range(px)
         || !buf.is_in_y_range(py)
         || !buf.is_in_x_range(px + w - 1)
@@ -280,14 +366,7 @@ fn calc_slope_point(da: i64, db: i64, ia: i64) -> Option<i64> {
     }
 }
 
-fn draw_line<T: Bitmap>(
-    buf: &mut T,
-    color: u32,
-    x0: i64,
-    y0: i64,
-    x1: i64,
-    y1: i64,
-) -> Result<()> {
+fn draw_line<T: Bitmap>(buf: &mut T, color: u32, x0: i64, y0: i64, x1: i64, y1: i64) -> Result<()> {
     if !buf.is_in_x_range(x0)
         || !buf.is_in_x_range(x1)
         || !buf.is_in_y_range(y0)
@@ -300,35 +379,31 @@ fn draw_line<T: Bitmap>(
     let dy = (y1 - y0).abs();
     let sy = (y1 - y0).signum();
     if dx >= dy {
-        for (rx, ry) in (0..dx)
-            .flat_map(|rx| calc_slope_point(dx, dy, rx).map(|ry| (rx, ry)))
-        {
+        for (rx, ry) in (0..dx).flat_map(|rx| calc_slope_point(dx, dy, rx).map(|ry| (rx, ry))) {
             draw_point(buf, color, x0 + rx * sx, y0 + ry * sy)?;
         }
     } else {
-        for (rx, ry) in (0..dy)
-            .flat_map(|ry| calc_slope_point(dy, dx, ry).map(|rx| (rx, ry)))
-        {
+        for (rx, ry) in (0..dy).flat_map(|ry| calc_slope_point(dy, dx, ry).map(|rx| (rx, ry))) {
             draw_point(buf, color, x0 + rx * sx, y0 + ry * sy)?;
         }
     }
     Ok(())
 }
 
-fn lookup_font(c: char) -> Option<[[char; 8];16]>{
+fn lookup_font(c: char) -> Option<[[char; 8]; 16]> {
     const FONT_SOURCE: &str = include_str!("./font.txt");
-    if let Ok(c) = u8::try_from(c){
+    if let Ok(c) = u8::try_from(c) {
         let mut fi = FONT_SOURCE.split('\n');
-        while let Some(line) = fi.next(){
-            if let Some(line) = line.strip_prefix("0x"){
-                if let Ok(idx) = u8::from_str_radix(line,16){
-                    if idx != c{
+        while let Some(line) = fi.next() {
+            if let Some(line) = line.strip_prefix("0x") {
+                if let Ok(idx) = u8::from_str_radix(line, 16) {
+                    if idx != c {
                         continue;
                     }
-                    let mut font = [['*';8];16];
-                    for (y,line) in fi.clone().take(16).enumerate(){
-                        for (x,c) in line.chars().enumerate(){
-                            if let Some(e) = font[y].get_mut(x){
+                    let mut font = [['*'; 8]; 16];
+                    for (y, line) in fi.clone().take(16).enumerate() {
+                        for (x, c) in line.chars().enumerate() {
+                            if let Some(e) = font[y].get_mut(x) {
                                 *e = c;
                             }
                         }
@@ -341,23 +416,23 @@ fn lookup_font(c: char) -> Option<[[char; 8];16]>{
     None
 }
 
-fn draw_font_fg<T: Bitmap>(buf: &mut T,x:i64,y:i64,color: u32,c:char){
-    if let Some(font) = lookup_font(c){
-        for (dy, row) in font.iter().enumerate(){
-            for (dx, pixel) in row.iter().enumerate(){
-                let color = match pixel{
+fn draw_font_fg<T: Bitmap>(buf: &mut T, x: i64, y: i64, color: u32, c: char) {
+    if let Some(font) = lookup_font(c) {
+        for (dy, row) in font.iter().enumerate() {
+            for (dx, pixel) in row.iter().enumerate() {
+                let color = match pixel {
                     '*' => color,
-                      _ => continue,
+                    _ => continue,
                 };
-                let _ = draw_point(buf, color, x + dx as i64,y+dy as i64);
+                let _ = draw_point(buf, color, x + dx as i64, y + dy as i64);
             }
         }
     }
 }
- 
-fn draw_str_fg<T: Bitmap>(buf: &mut T,x: i64, y: i64, color: u32, s: &str){
-    for (i,c) in s.chars().enumerate(){
-        draw_font_fg(buf,x+i as i64*8,y,color,c)
+
+fn draw_str_fg<T: Bitmap>(buf: &mut T, x: i64, y: i64, color: u32, s: &str) {
+    for (i, c) in s.chars().enumerate() {
+        draw_font_fg(buf, x + i as i64 * 8, y, color, c)
     }
 }
 
@@ -367,26 +442,26 @@ struct VramTextWriter<'a> {
     cursor_y: i64,
 }
 impl<'a> VramTextWriter<'a> {
-    fn new(vram: &'a mut VramBufferInfo) -> Self{
-        Self{
+    fn new(vram: &'a mut VramBufferInfo) -> Self {
+        Self {
             vram,
-        cursor_x: 0,
-        cursor_y: 0
+            cursor_x: 0,
+            cursor_y: 0,
         }
     }
 }
 
-impl fmt::Write for VramTextWriter<'_>{
-    fn write_str(&mut self, s: &str) ->fmt::Result{
-    for c in s.chars(){
-        if c == '\n'{
-            self.cursor_y += 16;
-            self.cursor_x = 0;
-            continue;
+impl fmt::Write for VramTextWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            if c == '\n' {
+                self.cursor_y += 16;
+                self.cursor_x = 0;
+                continue;
+            }
+            draw_font_fg(self.vram, self.cursor_x, self.cursor_y, 0xffffff, c);
+            self.cursor_x += 8;
         }
-        draw_font_fg(self.vram, self.cursor_x,self.cursor_y, 0xffffff,c);
-        self.cursor_x += 8;
-    }
         Ok(())
     }
 }
